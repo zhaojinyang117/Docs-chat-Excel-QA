@@ -6,7 +6,7 @@ import os
 import pickle
 from typing import List, Tuple, Optional, Dict, Any
 
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
 

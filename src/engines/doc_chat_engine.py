@@ -5,10 +5,11 @@
 from typing import List, Dict, Any, Optional, BinaryIO, Union
 from dataclasses import dataclass, field
 
-from langchain.schema import Document
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain_core.prompts import PromptTemplate
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.messages import HumanMessage, AIMessage
 
 import sys
 sys.path.insert(0, ".")
@@ -43,14 +44,7 @@ class DocChatEngine:
 4. 如果可能，请指出信息来源（如页码）
 
 上下文信息：
-{context}
-
-聊天历史：
-{chat_history}
-
-用户问题：{question}
-
-请回答："""
+{context}"""
     
     def __init__(
         self,
@@ -76,15 +70,8 @@ class DocChatEngine:
             index_name=index_name
         )
         
-        # 会话记忆
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer"
-        )
-        
-        # RAG 链
-        self._chain = None
+        # 会话历史
+        self.chat_history: List[Union[HumanMessage, AIMessage]] = []
         
         # 文档元数据
         self.loaded_files: List[str] = []
@@ -116,9 +103,6 @@ class DocChatEngine:
         if actual_filename not in self.loaded_files:
             self.loaded_files.append(actual_filename)
         
-        # 重建 RAG 链
-        self._chain = None
-        
         return len(documents)
     
     def load_files(
@@ -144,28 +128,22 @@ class DocChatEngine:
         
         return total
     
-    def _get_chain(self) -> ConversationalRetrievalChain:
-        """获取或创建 RAG 链"""
-        if self._chain is None:
-            if self.vector_store.store is None:
-                raise ValueError("请先加载文档")
-            
-            # 创建提示词模板
-            prompt = PromptTemplate(
-                template=self.SYSTEM_TEMPLATE,
-                input_variables=["context", "chat_history", "question"]
-            )
-            
-            # 创建 RAG 链
-            self._chain = ConversationalRetrievalChain.from_llm(
-                llm=self.llm,
-                retriever=self.vector_store.as_retriever(),
-                memory=self.memory,
-                return_source_documents=True,
-                combine_docs_chain_kwargs={"prompt": prompt}
-            )
+    def _format_docs(self, docs: List[Document]) -> str:
+        """格式化文档为字符串"""
+        return "\n\n".join(doc.page_content for doc in docs)
+    
+    def _format_chat_history(self) -> str:
+        """格式化聊天历史"""
+        if not self.chat_history:
+            return ""
         
-        return self._chain
+        history_str = "\n聊天历史：\n"
+        for msg in self.chat_history[-6:]:  # 只保留最近3轮对话
+            if isinstance(msg, HumanMessage):
+                history_str += f"用户: {msg.content}\n"
+            else:
+                history_str += f"助手: {msg.content}\n"
+        return history_str
     
     def chat(self, question: str) -> ChatResponse:
         """
@@ -177,25 +155,47 @@ class DocChatEngine:
         Returns:
             ChatResponse 对象
         """
-        chain = self._get_chain()
+        if self.vector_store.store is None:
+            raise ValueError("请先加载文档")
         
-        # 调用链
-        result = chain.invoke({"question": question})
+        # 检索相关文档
+        results = self.vector_store.search(question)
+        docs = [doc for doc, _ in results]
+        
+        # 构建上下文
+        context = self._format_docs(docs)
+        history = self._format_chat_history()
+        
+        # 构建提示词
+        full_prompt = f"""{self.SYSTEM_TEMPLATE.format(context=context)}
+{history}
+用户问题：{question}
+
+请回答："""
+        
+        # 调用 LLM
+        response = self.llm.invoke(full_prompt)
+        answer = response.content if hasattr(response, 'content') else str(response)
+        
+        # 更新聊天历史
+        self.chat_history.append(HumanMessage(content=question))
+        self.chat_history.append(AIMessage(content=answer))
         
         # 提取来源信息
         sources = []
-        for doc in result.get("source_documents", []):
+        for doc, score in results:
             source_info = {
                 "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
                 "source": doc.metadata.get("source", "未知"),
                 "page": doc.metadata.get("page", "N/A"),
                 "file_type": doc.metadata.get("file_type", "unknown"),
-                "chunk_index": doc.metadata.get("chunk_index", 0)
+                "chunk_index": doc.metadata.get("chunk_index", 0),
+                "score": float(score)
             }
             sources.append(source_info)
         
         return ChatResponse(
-            answer=result.get("answer", ""),
+            answer=answer,
             sources=sources
         )
     
@@ -238,16 +238,15 @@ class DocChatEngine:
     
     def clear_memory(self) -> None:
         """清空会话记忆"""
-        self.memory.clear()
+        self.chat_history = []
     
     def get_chat_history(self) -> List[Dict[str, str]]:
         """获取聊天历史"""
-        messages = self.memory.chat_memory.messages
         history = []
         
-        for msg in messages:
+        for msg in self.chat_history:
             history.append({
-                "role": "user" if msg.type == "human" else "assistant",
+                "role": "user" if isinstance(msg, HumanMessage) else "assistant",
                 "content": msg.content
             })
         
@@ -266,15 +265,13 @@ class DocChatEngine:
         """
         if self.vector_store.exists():
             self.vector_store.load()
-            self._chain = None
             return True
         return False
     
     def reset(self) -> None:
         """重置引擎（清空所有数据）"""
         self.vector_store.delete()
-        self.memory.clear()
-        self._chain = None
+        self.chat_history = []
         self.loaded_files = []
     
     def get_stats(self) -> Dict[str, Any]:
@@ -282,6 +279,5 @@ class DocChatEngine:
         return {
             "loaded_files": self.loaded_files,
             "document_count": self.vector_store.get_document_count(),
-            "chat_history_length": len(self.memory.chat_memory.messages)
+            "chat_history_length": len(self.chat_history)
         }
-
