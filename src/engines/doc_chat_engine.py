@@ -1,0 +1,287 @@
+"""
+文档聊天引擎
+基于 RAG 的文档问答，支持会话历史和来源追溯
+"""
+from typing import List, Dict, Any, Optional, BinaryIO, Union
+from dataclasses import dataclass, field
+
+from langchain.schema import Document
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain_core.prompts import PromptTemplate
+
+import sys
+sys.path.insert(0, ".")
+from src.llm_factory import get_llm, get_embedding
+from src.processors.document_processor import DocumentProcessor
+from src.stores.vector_store import VectorStore
+
+
+@dataclass
+class ChatResponse:
+    """聊天响应"""
+    answer: str
+    sources: List[Dict[str, Any]] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "answer": self.answer,
+            "sources": self.sources
+        }
+
+
+class DocChatEngine:
+    """文档聊天引擎"""
+    
+    # 系统提示词模板
+    SYSTEM_TEMPLATE = """你是一个专业的文档问答助手。请根据提供的上下文信息回答用户的问题。
+
+要求：
+1. 只根据提供的上下文信息回答，不要编造内容
+2. 如果上下文中没有相关信息，请明确告知用户
+3. 回答要准确、简洁、有条理
+4. 如果可能，请指出信息来源（如页码）
+
+上下文信息：
+{context}
+
+聊天历史：
+{chat_history}
+
+用户问题：{question}
+
+请回答："""
+    
+    def __init__(
+        self,
+        index_name: str = "doc_chat",
+        llm=None,
+        embedding=None
+    ):
+        """
+        初始化文档聊天引擎
+        
+        Args:
+            index_name: 向量索引名称
+            llm: LLM 实例
+            embedding: Embedding 实例
+        """
+        self.index_name = index_name
+        self.llm = llm or get_llm()
+        self.embedding = embedding or get_embedding()
+        
+        self.processor = DocumentProcessor()
+        self.vector_store = VectorStore(
+            embedding=self.embedding,
+            index_name=index_name
+        )
+        
+        # 会话记忆
+        self.memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True,
+            output_key="answer"
+        )
+        
+        # RAG 链
+        self._chain = None
+        
+        # 文档元数据
+        self.loaded_files: List[str] = []
+    
+    def load_file(
+        self,
+        file: Union[str, BinaryIO],
+        filename: str = None
+    ) -> int:
+        """
+        加载单个文件
+        
+        Args:
+            file: 文件路径或文件对象
+            filename: 文件名
+            
+        Returns:
+            加载的文档块数量
+        """
+        documents = self.processor.process(file, filename)
+        
+        if self.vector_store.store is None:
+            self.vector_store.create_from_documents(documents)
+        else:
+            self.vector_store.add_documents(documents)
+        
+        # 记录加载的文件
+        actual_filename = filename or (file if isinstance(file, str) else getattr(file, 'name', 'unknown'))
+        if actual_filename not in self.loaded_files:
+            self.loaded_files.append(actual_filename)
+        
+        # 重建 RAG 链
+        self._chain = None
+        
+        return len(documents)
+    
+    def load_files(
+        self,
+        files: List[Union[str, BinaryIO]],
+        filenames: List[str] = None
+    ) -> int:
+        """
+        加载多个文件
+        
+        Args:
+            files: 文件列表
+            filenames: 文件名列表
+            
+        Returns:
+            加载的文档块总数
+        """
+        total = 0
+        filenames = filenames or [None] * len(files)
+        
+        for file, filename in zip(files, filenames):
+            total += self.load_file(file, filename)
+        
+        return total
+    
+    def _get_chain(self) -> ConversationalRetrievalChain:
+        """获取或创建 RAG 链"""
+        if self._chain is None:
+            if self.vector_store.store is None:
+                raise ValueError("请先加载文档")
+            
+            # 创建提示词模板
+            prompt = PromptTemplate(
+                template=self.SYSTEM_TEMPLATE,
+                input_variables=["context", "chat_history", "question"]
+            )
+            
+            # 创建 RAG 链
+            self._chain = ConversationalRetrievalChain.from_llm(
+                llm=self.llm,
+                retriever=self.vector_store.as_retriever(),
+                memory=self.memory,
+                return_source_documents=True,
+                combine_docs_chain_kwargs={"prompt": prompt}
+            )
+        
+        return self._chain
+    
+    def chat(self, question: str) -> ChatResponse:
+        """
+        进行对话
+        
+        Args:
+            question: 用户问题
+            
+        Returns:
+            ChatResponse 对象
+        """
+        chain = self._get_chain()
+        
+        # 调用链
+        result = chain.invoke({"question": question})
+        
+        # 提取来源信息
+        sources = []
+        for doc in result.get("source_documents", []):
+            source_info = {
+                "content": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
+                "source": doc.metadata.get("source", "未知"),
+                "page": doc.metadata.get("page", "N/A"),
+                "file_type": doc.metadata.get("file_type", "unknown"),
+                "chunk_index": doc.metadata.get("chunk_index", 0)
+            }
+            sources.append(source_info)
+        
+        return ChatResponse(
+            answer=result.get("answer", ""),
+            sources=sources
+        )
+    
+    def ask(self, question: str) -> str:
+        """
+        简单问答（仅返回答案）
+        
+        Args:
+            question: 用户问题
+            
+        Returns:
+            答案文本
+        """
+        response = self.chat(question)
+        return response.answer
+    
+    def get_relevant_documents(self, query: str, k: int = 4) -> List[Dict[str, Any]]:
+        """
+        获取相关文档（不调用 LLM）
+        
+        Args:
+            query: 查询文本
+            k: 返回数量
+            
+        Returns:
+            相关文档列表
+        """
+        results = self.vector_store.search(query, k=k)
+        
+        return [
+            {
+                "content": doc.page_content,
+                "source": doc.metadata.get("source", "未知"),
+                "page": doc.metadata.get("page", "N/A"),
+                "score": float(score),
+                "metadata": doc.metadata
+            }
+            for doc, score in results
+        ]
+    
+    def clear_memory(self) -> None:
+        """清空会话记忆"""
+        self.memory.clear()
+    
+    def get_chat_history(self) -> List[Dict[str, str]]:
+        """获取聊天历史"""
+        messages = self.memory.chat_memory.messages
+        history = []
+        
+        for msg in messages:
+            history.append({
+                "role": "user" if msg.type == "human" else "assistant",
+                "content": msg.content
+            })
+        
+        return history
+    
+    def save_index(self) -> None:
+        """保存向量索引"""
+        self.vector_store.save()
+    
+    def load_index(self) -> bool:
+        """
+        加载已保存的向量索引
+        
+        Returns:
+            是否成功加载
+        """
+        if self.vector_store.exists():
+            self.vector_store.load()
+            self._chain = None
+            return True
+        return False
+    
+    def reset(self) -> None:
+        """重置引擎（清空所有数据）"""
+        self.vector_store.delete()
+        self.memory.clear()
+        self._chain = None
+        self.loaded_files = []
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """获取统计信息"""
+        return {
+            "loaded_files": self.loaded_files,
+            "document_count": self.vector_store.get_document_count(),
+            "chat_history_length": len(self.memory.chat_memory.messages)
+        }
+

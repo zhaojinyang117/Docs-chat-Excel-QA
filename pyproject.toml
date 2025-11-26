@@ -1,0 +1,41 @@
+[project]
+name = "docs-chat-excel-qa"
+version = "0.1.0"
+description = "AI 文档聊天 & Excel QA 系统"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Streamlit 前端
+    "streamlit>=1.28.0",
+    
+    # LangChain 核心
+    "langchain>=0.2.0",
+    "langchain-openai>=0.1.0",
+    "langchain-community>=0.2.0",
+    
+    # 向量存储
+    "faiss-cpu>=1.7.4",
+    
+    # 文档解析
+    "pypdf>=4.0.0",
+    "python-docx>=1.1.0",
+    
+    # Excel 处理
+    "openpyxl>=3.1.0",
+    "pandas>=2.0.0",
+    "pandasai>=2.0.0",
+    
+    # 工具库
+    "python-dotenv>=1.0.0",
+    "tiktoken>=0.5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+]
+
