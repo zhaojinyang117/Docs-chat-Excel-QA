@@ -3,6 +3,7 @@ Excel QA 引擎
 基于 PandasAI 的智能表格问答
 """
 import os
+import re
 from typing import List, Dict, Any, Optional, BinaryIO, Union
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -12,10 +13,13 @@ import pandas as pd
 # PandasAI 相关导入
 try:
     from pandasai import SmartDataframe, Agent
-    from pandasai.llm import LangchainLLM
+    from pandasai.llm import LangchainLLM as PandasLangchainLLM
+    from pandasai.exceptions import NoCodeFoundError
     PANDASAI_AVAILABLE = True
 except ImportError:
     PANDASAI_AVAILABLE = False
+    NoCodeFoundError = Exception
+    PandasLangchainLLM = object
 
 import sys
 sys.path.insert(0, ".")
@@ -50,6 +54,30 @@ class ExcelResponse:
         }
 
 
+if PANDASAI_AVAILABLE:
+    class TrackingLangchainLLM(PandasLangchainLLM):
+        """
+        扩展 PandasAI 的 LangchainLLM，用于记录最近一次生成的代码
+        """
+        
+        def __init__(self, langchain_llm):
+            super().__init__(langchain_llm)
+            self.last_generated_code: str = ""
+        
+        def generate_code(self, instruction, context):
+            """
+            生成代码时顺便把代码缓存到 last_generated_code
+            """
+            response = self.call(instruction, context)
+            code = self._extract_code(response)
+            self.last_generated_code = code
+            return code
+else:
+    class TrackingLangchainLLM:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            raise ImportError("PandasAI 未安装，请运行: uv add pandasai")
+
+
 class ExcelQAEngine:
     """Excel 问答引擎"""
     
@@ -70,9 +98,103 @@ class ExcelQAEngine:
         self.excel_data: Optional[ExcelData] = None
         self.smart_dfs: Dict[str, SmartDataframe] = {}
         self.agent: Optional[Agent] = None
+        self.pandasai_llm: Optional[TrackingLangchainLLM] = None
         
         # 聊天历史
         self.chat_history: List[Dict[str, str]] = []
+    def _extract_python_code(self, text: str) -> Optional[str]:
+        """
+        从 LLM 返回文本中提取 Python 代码块
+        
+        优先匹配 ```python ... ``` 或 ``` ... ```，如果没有代码块，则尝试整体作为代码。
+        """
+        code = None
+        
+        # 优先匹配 ```python ... ``` / ``` ... ```
+        match = re.search(r"```(?:python)?\s*(.*?)```", text, re.IGNORECASE | re.DOTALL)
+        if match:
+            code = match.group(1).strip()
+        else:
+            code = text.strip()
+        
+        if not code:
+            return None
+        
+        # 尝试编译，避免明显不是代码的内容
+        try:
+            compile(code, "<excel_fallback>", "exec")
+        except SyntaxError:
+            return None
+        
+        return code
+    
+    def _fallback_answer_with_code_regeneration(
+        self,
+        question: str,
+        sheet_name: str = None
+    ) -> ExcelResponse:
+        """
+        当 PandasAI 无法从响应中提取代码时的兜底策略：
+        直接调用当前 LLM，请其只输出代码块，然后执行代码。
+        """
+        if self.excel_data is None or not self.excel_data.sheets:
+            return ExcelResponse(
+                answer="没有可用的 Excel 数据",
+                answer_type="error",
+                error="Excel 数据为空"
+            )
+        
+        # 选择用于提示的 Sheet
+        target_sheet = None
+        if sheet_name:
+            target_sheet = self.excel_data.get_sheet(sheet_name)
+        if target_sheet is None:
+            target_sheet = self.excel_data.sheets[0]
+            sheet_name = target_sheet.name
+        
+        df = target_sheet.dataframe
+        preview = df.head(5).to_string(index=False)
+        columns_desc = ", ".join(map(str, df.columns))
+        
+        prompt = (
+            "你是一个熟练使用 pandas 进行数据分析的助手。\n"
+            f"现在有一个名为 '{target_sheet.name}' 的 DataFrame，包含如下列：\n"
+            f"{columns_desc}\n\n"
+            "下面是该表前几行示例数据：\n"
+            f"{preview}\n\n"
+            "请根据用户问题编写一段 pandas 代码来得到答案，要求：\n"
+            "1. 只输出 Python 代码，不要任何解释文字；\n"
+            "2. 不要使用 input 或其它交互式输入；\n"
+            "3. 不要打印中间调试信息；\n"
+            "4. 最终结果赋值给变量 result。\n\n"
+            f"用户问题：{question}"
+        )
+        
+        try:
+            llm_response = self.llm.invoke(prompt)
+            raw_text = getattr(llm_response, "content", None) or str(llm_response)
+            code = self._extract_python_code(raw_text)
+            
+            if not code:
+                return ExcelResponse(
+                    answer="无法从模型返回中提取可执行代码，请尝试调整问题描述或更换模型。",
+                    answer_type="error",
+                    sheet_name=sheet_name or "",
+                    generated_code=raw_text,
+                    error="fallback_no_code_found"
+                )
+            
+            exec_result = self.execute_pandas(code, sheet_name=target_sheet.name)
+            exec_result.generated_code = code
+            return exec_result
+        
+        except Exception as e:
+            return ExcelResponse(
+                answer=f"兜底处理失败: {str(e)}",
+                answer_type="error",
+                sheet_name=sheet_name or "",
+                error=str(e)
+            )
     
     def load_file(
         self,
@@ -95,8 +217,9 @@ class ExcelQAEngine:
         # 为每个 Sheet 创建 SmartDataframe
         self.smart_dfs = {}
         
-        # 包装 LLM
-        pandasai_llm = LangchainLLM(self.llm)
+        # 包装 LLM（带代码跟踪能力）
+        self.pandasai_llm = TrackingLangchainLLM(self.llm)
+        pandasai_llm = self.pandasai_llm
         
         all_dfs = []
         for sheet in self.excel_data.sheets:
@@ -248,6 +371,12 @@ class ExcelQAEngine:
             
             result = self._parse_response(response, sheet_name)
             
+            # 尝试从 PandasAI LLM 中获取本次生成的代码
+            if self.pandasai_llm is not None:
+                generated_code = getattr(self.pandasai_llm, "last_generated_code", "")
+                if generated_code:
+                    result.generated_code = generated_code
+            
             # 记录聊天历史
             self.chat_history.append({
                 "role": "user",
@@ -259,7 +388,24 @@ class ExcelQAEngine:
             })
             
             return result
+        
+        except NoCodeFoundError:
+            # 当 PandasAI 无法从响应里提取代码时，使用兜底逻辑
+            fallback_result = self._fallback_answer_with_code_regeneration(
+                question, sheet_name
+            )
             
+            self.chat_history.append({
+                "role": "user",
+                "content": question
+            })
+            self.chat_history.append({
+                "role": "assistant",
+                "content": str(fallback_result.answer)
+            })
+            
+            return fallback_result
+        
         except Exception as e:
             error_msg = str(e)
             return ExcelResponse(
@@ -310,7 +456,7 @@ class ExcelQAEngine:
         
         # 准备执行环境
         local_vars = {"pd": pd}
-        
+            
         # 添加所有 DataFrame 到执行环境
         for sheet in self.excel_data.sheets:
             # 使用安全的变量名
@@ -320,9 +466,10 @@ class ExcelQAEngine:
         
         try:
             exec(code, {"__builtins__": {}}, local_vars)
-            result = local_vars.get("result", None)
-            
-            return self._parse_response(result, sheet_name or "")
+            result_value = local_vars.get("result", None)
+            parsed = self._parse_response(result_value, sheet_name or "")
+            parsed.generated_code = code
+            return parsed
             
         except Exception as e:
             return ExcelResponse(

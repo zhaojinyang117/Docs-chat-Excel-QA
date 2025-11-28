@@ -6,6 +6,11 @@ import streamlit as st
 import pandas as pd
 from typing import Optional
 
+from rich.traceback import install as rich_traceback_install
+
+# 安装 Rich 美化 Traceback（对控制台错误输出生效）
+rich_traceback_install(show_locals=True)
+
 # 设置页面配置（必须在最前面）
 st.set_page_config(
     page_title="AI 文档聊天 & Excel QA",
@@ -362,6 +367,11 @@ def render_excel_qa():
                 meta = msg["metadata"]
                 if meta.get("sheet_name"):
                     st.caption(f"📍 来源: {meta.get('sheet_name', '')}")
+                
+                generated_code = meta.get("generated_code")
+                if generated_code:
+                    with st.expander("🧮 查看生成的代码"):
+                        st.code(generated_code, language="python")
     
     # 聊天输入
     if prompt := st.chat_input("输入你的问题，例如：销售额最高的产品是什么？"):
@@ -395,13 +405,19 @@ def render_excel_qa():
                     if response.sheet_name:
                         st.caption(f"📍 来源: {response.sheet_name}")
                     
+                    # 显示生成的代码（如果有）
+                    if response.generated_code:
+                        with st.expander("🧮 查看生成的代码"):
+                            st.code(response.generated_code, language="python")
+                    
                     # 添加到消息历史
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": display_content,
                         "metadata": {
                             "sheet_name": response.sheet_name,
-                            "answer_type": response.answer_type
+                            "answer_type": response.answer_type,
+                            "generated_code": response.generated_code
                         }
                     })
                     
